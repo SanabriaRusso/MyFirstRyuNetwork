@@ -73,7 +73,7 @@ class Exp4(app_manager.RyuApp):
         self.reverse_alternate_mac = self.mac_of_experiment[4]
         self.reverse_alternate_ip = '12.1.14.103'
         
-        self.server_mac = self.mac_of_experiment[6]
+        self.server_mac = self.mac_of_experiment[8]
         self.server_ip = '10.30.30.1'
         
         self.default_path_port = 1
@@ -83,6 +83,8 @@ class Exp4(app_manager.RyuApp):
         self.default_arp_table = {}
 
         self.switches_dpid_to_mac = {}
+        
+        self.flows = {}
         
         # Converting the MAC addresses to decimal to compare with the passed dpid
         self.ovsk_dpid = int(re.sub('[:]', '', self.ovsk_mac), 16)
@@ -113,29 +115,83 @@ class Exp4(app_manager.RyuApp):
         self.add_flow(datapath, 0, match, actions)        
         self.mac_to_port.setdefault(datapath.id, {})
         self.default_arp_table.setdefault(datapath.id, {})
+        self.flows.setdefault(datapath.id, {})
         
-        self._fix_arp_to_server(datapath.id)
+        self._fix_arp_to_server(datapath)
         
-    def _fix_arp_to_server(self, dpid):
+    def _fix_arp_to_server(self, dp):
         """Changes the arp table of the server IP entry according to the test"""
         
+        dpid = dp.id
         if dpid not in self.switches_dpid_to_mac:
             # ignoring other switches
             return
         
         print "--->[%s] Filling ARP table" % dpid
         if dpid == self.ovsk_dpid:
-            self.default_arp_table[dpid] = {self.server_ip : self.server_mac,
-                                            self.source_ip : self.source_mac,
+            self.default_arp_table[dpid] = {self.source_ip : self.source_mac,
                                             self.ovsk_ip : self.ovsk_mac,
                                             self.default_path_ip : self.default_path_mac,  
                                             self.alternate_path_ip : self.alternate_path_mac}
         elif dpid == self.ovsk_server_dpid:
             self.default_arp_table[dpid] = {self.server_ip : self.server_mac,
-                                            self.source_ip : self.source_mac,
                                             self.ovsk_server_ip : self.ovsk_server_mac,
                                             self.reverse_default_ip : self.reverse_default_mac,                  self.reverse_alternate_ip : self.reverse_alternate_mac}
         
+        print "\tARP table for [%s]: %s" % (dpid, self.default_arp_table[dpid],)
+        
+    def _handle_arp(self, dp, in_port, eth_pkt, pkt_arp):
+        """Handling ARP request and providing a reply based on our table"""
+        
+        if pkt_arp.opcode != arp.ARP_REQUEST:
+            # ignore all except arp requests
+            return
+        elif pkt_arp.dst_ip not in self.default_arp_table[dp.id]:
+            print "[%s] ARP not in default table, dst: %s" % (dp.id, pkt_arp.dst_ip)
+            return
+        
+        req_dst = pkt_arp.dst_ip
+        print ("--->[%s] Handling ARP message from %s, asking for: %s" % (dp.id, eth_pkt.src, req_dst))
+        
+        # Creating an arp reply message
+        # Starting with a common ethernet frame from ovsk to requester
+        pkt = packet.Packet()
+        pkt.add_protocol(ethernet.ethernet(ethertype=eth_pkt.ethertype,
+                                          dst=eth_pkt.src,
+                                          src=self.switches_dpid_to_mac[dp.id]))
+        
+        pkt.add_protocol(arp.arp(opcode=arp.ARP_REPLY,
+                                src_mac=self.default_arp_table[dp.id][req_dst],
+                                src_ip=req_dst,
+                                dst_mac=pkt_arp.src_mac,
+                                dst_ip=pkt_arp.src_ip))
+        
+        # updating local tables
+        self.default_arp_table[dp.id][pkt_arp.src_ip] = pkt_arp.src_mac
+        self.mac_to_port[dp.id][pkt_arp.src_mac] = in_port        
+        
+        self._send_arp_reply(dp, pkt, in_port)
+
+    def _send_arp_reply(self, dp, pkt, port):
+        """Sending a packet comming from _handle_arp"""
+        
+        ofproto = dp.ofproto
+        parser = dp.ofproto_parser
+        pkt.serialize()
+        print ("--->[%s] Sending ARP reply: %s" % (dp.id, pkt,))
+        
+        data = pkt.data
+        
+        actions = [parser.OFPActionOutput(port=ofproto.OFPP_IN_PORT)]
+        
+        out = parser.OFPPacketOut(datapath=dp,
+                                 buffer_id=ofproto.OFP_NO_BUFFER,
+                                 in_port=port,
+                                 actions=actions,
+                                 data=data)
+        dp.send_msg(out)
+        
+        print "--->[%s] Sending through port: %s\n" % (dp.id, port)
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None, _timeout=0):
         """Adding a flow. Trying to keep it as general as possible"""
@@ -150,7 +206,8 @@ class Exp4(app_manager.RyuApp):
         else:
             print(match)
 
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, 
+                                             actions)]
 
         mod = parser.OFPFlowMod(datapath=datapath, 
                                 idle_timeout=_timeout,
@@ -184,122 +241,83 @@ class Exp4(app_manager.RyuApp):
         dst = eth.dst
         src = eth.src
         
+        # Catching ARP requests
         if dst not in self.mac_of_experiment:
-            print ("--->[%s] MAC destination unknown: %s, src: %s" % (dpid, dst, src))
             if eth.ethertype == ether_types.ETH_TYPE_ARP:
                 pkt_arp = pkt.get_protocol(arp.arp)
-                self._handle_arp(datapath, in_port, eth, pkt_arp)
-            return
+                if pkt_arp:
+                    print "--->[%s] Going to handle ARP request, in_port: %s" % (dpid, in_port)
+                    self._handle_arp(datapath, in_port, eth, pkt_arp)
+                else:
+                    print "--->[%s] Void ARP request from: %s" % (dpid, src)
         else:
             self._press.showPkt(dpid, src, dst, in_port)
 
         # Matching the ipv4_dst of the packet and acting accordingly
         if not ip4_pkt:
-            print ("--->[%s] Packet without destination IP protocol. Ignoring." % dpid)
+            print ("--->[%s] Packet without destination IP protocol. Ignoring.\n" % dpid)
             return
-        elif (ip4_pkt.dst == self.server_ip) or (ip4_pkt.src == self.server_ip):
-            self.handle_path(in_port, ip4_pkt, datapath, msg)
-        else:
-            print "--->[%s] Packet goes elsewhere: %s" % (dpid, ip4_pkt.dst)
-            return
-        
-    def _handle_arp(self, dp, in_port, eth_pkt, pkt_arp):
-        """Handling ARP request and providing a reply based on our table"""
-        
-        if pkt_arp.opcode != arp.ARP_REQUEST:
-            # ignore all except arp requests
-            return
-        elif pkt_arp.dst_ip not in self.default_arp_table[dp.id]:
-            print "[%s] ARP not in default table, dst: %s" % (dp.id, pkt_arp.dst_ip)
-            return
-        
-        req_dst = pkt_arp.dst_ip
-        print ("--->[%s] Handling ARP message from %s, asking for: %s" % (dp.id, eth_pkt.src, req_dst))
-        
-        # Creating an arp reply message
-        # Starting with a common ethernet frame from ovsk to requester
-        pkt = packet.Packet()
-        pkt.add_protocol(ethernet.ethernet(ethertype=eth_pkt.ethertype,
-                                          dst=eth_pkt.src,
-                                          src=self.switches_dpid_to_mac[dp.id]))
-        
-        pkt.add_protocol(arp.arp(opcode=arp.ARP_REPLY,
-                                src_mac=self.default_arp_table[dp.id][req_dst],
-                                src_ip=req_dst,
-                                dst_mac=pkt_arp.src_mac,
-                                dst_ip=pkt_arp.src_ip))
-        
-        self._send_packet(dp, in_port, pkt)
-        
-    def _send_packet(self, dp, port, pkt):
-        """Sending a packet, generally comming from _handle_arp"""
-        
-        ofproto = dp.ofproto
-        parser = dp.ofproto_parser
-        pkt.serialize()
-        print ("Sending ARP reply: %s" % (pkt,))
-        
-        data = pkt.data
-        actions = [parser.OFPActionOutput(port=port)]
-        out = parser.OFPPacketOut(datapath=dp,
-                                 buffer_id=ofproto.OFP_NO_BUFFER,
-                                 in_port=ofproto.OFPP_CONTROLLER,
-                                 actions=actions,
-                                 data=data)
-        dp.send_msg(out)
+        elif (dpid == self.ovsk_dpid) and (ip4_pkt.dst == self.server_ip):
+            self.handle_path(in_port, eth, ip4_pkt, datapath, msg)
     
-    def handle_path(self, in_port, ip4_pkt, datapath, msg):
+    def handle_path(self, in_port, eth, ip4_pkt, datapath, msg):
         """Halding the flow mods for the default path"""
         
         dpid = datapath.id
+        ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         out_port = None
         dst_to = None
-            
-        # matching from source to server and back
-        if dpid == self.ovsk_dpid:
-            dst_to = self.default_path_mac
-            out_port = self.default_path_port
-            if self.default_path == False:
-                dst_to = self.alternate_path_mac
-                out_port = self.alternate_path_port
-                                        
-            self.mac_to_port[dpid][dst_to] = out_port
-            
-            #actions to reach Server
-            actions_to = [parser.OFPActionOutput(self.mac_to_port[dpid][dst_to])]  
-            
-            #matching packets to Server
-            match_to = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, in_port=self.source_port, ipv4_dst=ip4_pkt.dst)
-            
-            # now doing the reverse path
-            dst_local = self.source_mac
-            
-            #writing the port towards Source
-            self.mac_to_port[dpid][dst_local] = self.source_port
-            
-            #actions to reach Source
-            actions_local = [parser.OFPActionOutput(self.mac_to_port[dpid][dst_local])]
         
-            #matching packets to Source
-            match_local = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, ipv4_dst=ip4_pkt.src)
-        
-            # flow_mod & packet_out
-            self.add_flow(datapath, 1, match_to, actions_to)
-            self.add_flow(datapath, 1, match_local, actions_local)
-            
-        
-            data = None
-            if msg.buffer_id == datapath.ofproto.OFP_NO_BUFFER:
-                data = msg.data
-
-            out = parser.OFPPacketOut(datapath=datapath,
-                                      buffer_id=msg.buffer_id,
-                                      in_port=in_port, 
-                                      actions=actions_to, 
-                                      data=data)
-            datapath.send_msg(out)
-        elif dpid == self.ovsk_server_dpid:
+        #Skipping existing flows
+        if ip4_pkt.dst in self.flows[dpid]:
             return
-            
-            
+        
+        # Picking flow entries according to the experiment
+        dst_to = self.default_path_mac
+        out_port = self.default_path_port
+        if self.default_path == False:
+            dst_to = self.alternate_path_mac
+            out_port = self.alternate_path_port
+
+        self.mac_to_port[dpid][dst_to] = out_port
+
+        #actions to reach Server
+        actions_to = [parser.OFPActionOutput(port=self.mac_to_port[dpid][dst_to])]  
+
+        #matching packets to Server
+        match_to = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, 
+                                   ipv4_dst=ip4_pkt.dst, 
+                                   in_port=self.source_port)
+
+        ###############################################################################
+        # now doing the reverse path
+        dst_local = eth.src
+
+        #writing the port towards the source
+        self.mac_to_port[dpid][dst_local] = self.source_port
+
+        #actions to reach the source
+        actions_local = [parser.OFPActionOutput(port=self.mac_to_port[dpid][dst_local])]
+
+        #matching packets to the source
+        match_local = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, 
+                                      ipv4_dst=ip4_pkt.src, 
+                                      in_port=self.mac_to_port[dpid][dst_local])
+
+        # flow_mod & packet_out
+        self.add_flow(datapath, 1, match_to, actions_to)
+        self.add_flow(datapath, 1, match_local, actions_local)
+        self.flows[dpid] = {ip4_pkt.src : ip4_pkt.dst,
+                           ip4_pkt.dst : ip4_pkt.src}
+
+        data = None
+        if msg.buffer_id == datapath.ofproto.OFP_NO_BUFFER:
+            data = msg.data
+
+        out = parser.OFPPacketOut(datapath=datapath,
+                                  buffer_id=msg.buffer_id,
+                                  in_port=ofproto.OFPP_IN_PORT, 
+                                  actions=actions_to, 
+                                  data=data)
+        datapath.send_msg(out)
