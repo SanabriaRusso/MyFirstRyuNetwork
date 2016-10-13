@@ -49,8 +49,10 @@ class Exp4(app_manager.RyuApp):
         self._press = presentation.Presentation()
         self._press.boot()
         
-        self._exp4 = True #Are we doing exp4?
-        self.default_path = False
+        self.jump_between_paths = True  
+        self.hard_timeout = 10
+        self.idle_timeout = 5
+        self.default_path = True
         
         self.ovsk_mac = self.mac_of_experiment[0]
         self.ovsk_ip = '10.1.14.102'
@@ -193,7 +195,7 @@ class Exp4(app_manager.RyuApp):
         
         print "--->[%s] Sending through port: %s\n" % (dp.id, port)
 
-    def add_flow(self, datapath, priority, match, actions, buffer_id=None, _timeout=0):
+    def add_flow(self, datapath, priority, match, actions, idle_timeout=0, hard_timeout=0, buffer_id=None):
         """Adding a flow. Trying to keep it as general as possible"""
         
         ofproto = datapath.ofproto
@@ -209,11 +211,12 @@ class Exp4(app_manager.RyuApp):
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, 
                                              actions)]
 
-        mod = parser.OFPFlowMod(datapath=datapath, 
-                                idle_timeout=_timeout,
+        mod = parser.OFPFlowMod(datapath=datapath,
+                                idle_timeout=idle_timeout,
                                 priority=priority,
                                 match=match, 
-                                instructions=inst)
+                                instructions=inst,
+                                hard_timeout=hard_timeout)
         datapath.send_msg(mod)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
@@ -257,57 +260,63 @@ class Exp4(app_manager.RyuApp):
         if not ip4_pkt:
             print ("--->[%s] Packet without destination IP protocol. Ignoring.\n" % dpid)
             return
-        elif (dpid == self.ovsk_dpid) and (ip4_pkt.dst == self.server_ip):
+        elif (dpid == self.ovsk_dpid) and (ip4_pkt.dst == self.ovsk_server_ip):
             self.handle_path(in_port, eth, ip4_pkt, datapath, msg)
+        elif dpid == self.ovsk_server_dpid:
+            self.bouncer(in_port, eth, ip4_pkt, datapath, msg)
+            
     
     def handle_path(self, in_port, eth, ip4_pkt, datapath, msg):
-        """Halding the flow mods for the default path"""
+        """Halding the flow mods for the path"""
         
         dpid = datapath.id
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         out_port = None
         dst_to = None
-        
-        #Skipping existing flows
-        if ip4_pkt.dst in self.flows[dpid]:
-            return
+        hard_timeout = 0
+        idle_timeout = self.idle_timeout 
         
         # Picking flow entries according to the experiment
-        dst_to = self.default_path_mac
-        out_port = self.default_path_port
-        if self.default_path == False:
+        if self.jump_between_paths == True:
+            self.default_path = not self.default_path
+            hard_timeout = self.hard_timeout
+        
+        if self.default_path == True:
+            dst_to = self.default_path_mac
+            out_port = self.default_path_port
+        else:
             dst_to = self.alternate_path_mac
             out_port = self.alternate_path_port
 
         self.mac_to_port[dpid][dst_to] = out_port
 
         #actions to reach Server
-        actions_to = [parser.OFPActionOutput(port=self.mac_to_port[dpid][dst_to])]  
+        actions_to = [parser.OFPActionSetField(eth_dst=dst_to), 
+                      parser.OFPActionOutput(port=self.mac_to_port[dpid][dst_to])]  
 
         #matching packets to Server
         match_to = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, 
-                                   ipv4_dst=ip4_pkt.dst, 
-                                   in_port=self.source_port)
+                                   ipv4_dst=ip4_pkt.dst)
 
         ###############################################################################
         # now doing the reverse path
         dst_local = eth.src
 
         #writing the port towards the source
-        self.mac_to_port[dpid][dst_local] = self.source_port
+        self.mac_to_port[dpid][dst_local] = in_port
 
         #actions to reach the source
         actions_local = [parser.OFPActionOutput(port=self.mac_to_port[dpid][dst_local])]
 
         #matching packets to the source
         match_local = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, 
-                                      ipv4_dst=ip4_pkt.src, 
-                                      in_port=self.mac_to_port[dpid][dst_local])
+                                      ipv4_dst=ip4_pkt.src)
 
         # flow_mod & packet_out
-        self.add_flow(datapath, 1, match_to, actions_to)
-        self.add_flow(datapath, 1, match_local, actions_local)
+        self.add_flow(datapath, 1, match_to, actions_to, idle_timeout, hard_timeout)
+        self.add_flow(datapath, 1, match_local, actions_local, idle_timeout, hard_timeout)
+        
         self.flows[dpid] = {ip4_pkt.src : ip4_pkt.dst,
                            ip4_pkt.dst : ip4_pkt.src}
 
@@ -321,3 +330,61 @@ class Exp4(app_manager.RyuApp):
                                   actions=actions_to, 
                                   data=data)
         datapath.send_msg(out)
+    
+    def bouncer(self, in_port, eth, ip4_pkt, datapath, msg):
+        """Bounce back packets without adding flows"""
+        
+        dpid = datapath.id
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        out_port = None
+        dst_to = None
+        hard_timeout = 0
+        idle_timeout = 1
+    
+        #saving mac and port to our table
+        self.mac_to_port[dpid][eth.src] = in_port
+        dst_to = eth.dst    
+        
+        if dst_to == self.ovsk_server_mac:
+            out_port = ofproto.OFPP_LOCAL
+            self.mac_to_port[dpid][dst_to] = out_port
+        elif dst_to not in self.mac_to_port[dpid]:
+            return
+        
+        #actions to reach Server
+        actions_to = [parser.OFPActionOutput(port=self.mac_to_port[dpid][dst_to])]  
+
+        #matching packets to Server
+        match_to = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, 
+                                   ipv4_dst=ip4_pkt.dst)
+
+        ###############################################################################
+        # now doing the reverse path, trying to match all relevant destinations
+        dst_local = eth.src
+
+        #actions to reach the source
+        actions_local = [parser.OFPActionSetField(eth_dst=dst_local),
+                         parser.OFPActionOutput(port=self.mac_to_port[dpid][dst_local])]
+
+        #matching packets to the source
+        match_local = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP, 
+                                      ipv4_dst=ip4_pkt.src)
+
+        # flow_mod & packet_out
+        self.add_flow(datapath, 1, match_to, actions_to, idle_timeout, hard_timeout)
+        self.add_flow(datapath, 1, match_local, actions_local, idle_timeout, hard_timeout)
+        #self.flows[dpid] = {ip4_pkt.src : ip4_pkt.dst,
+        #                   ip4_pkt.dst : ip4_pkt.src}
+
+        data = None
+        if msg.buffer_id == datapath.ofproto.OFP_NO_BUFFER:
+            data = msg.data
+
+        out = parser.OFPPacketOut(datapath=datapath,
+                                  buffer_id=msg.buffer_id,
+                                  in_port=ofproto.OFPP_IN_PORT, 
+                                  actions=actions_to, 
+                                  data=data)
+        datapath.send_msg(out)
+        
