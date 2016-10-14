@@ -18,17 +18,15 @@ class Presentation(object):
     def showPkt(self, dpid, src, dst, in_port):
         """Print detailed information about a packet"""
         print
-        print ("---> Pkt in handler: dpid %s, src: %s, dst: %s, port: %s" % (dpid, src, dst, in_port))
-        print
+        print ("--->[%s] Pkt in handler: src: %s, dst: %s, port: %s" % (dpid, src, dst, in_port))
         return
 
     def boot(self):
         """Marks the start of the experiment"""
-        print("---> Starting Simple Switch custom")
+        print("---> Starting Presentation class")
         return
 
     def flowAdded(self, dp, in_port=0, ip_dst=0):
         """Show information about added flows"""
-        print
-        print ("---> Flow added: datapath %s, in_port: %s, dst: %s" % (dp, in_port, ip_dst))
+        print ("--->[%s] Flow added: in_port: %s, dst: %s" % (dp.id, in_port, ip_dst))
         print
